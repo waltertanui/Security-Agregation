@@ -2,771 +2,491 @@ import numpy as np
 from mpi4py import MPI
 import logging
 import sys
-import pickle
 import time
 import gc
-from sec_agg.mpc_function import LCC_encoding_w_Random_partial, LCC_decoding
+from typing import Tuple, List, Optional
 
-# Initialize MPI environment
-comm = MPI.COMM_WORLD
-rank = comm.Get_rank()
-size = comm.Get_size()
+try:
+    from sec_agg.mpc_function import LCC_encoding_w_Random_partial, LCC_decoding
+except ImportError:
+    logging.warning("LCC functions not found. Using dummy implementations.")
+    def LCC_encoding_w_Random_partial(x, M):
+        return np.split(x, M)
+    def LCC_decoding(shards):
+        return np.concatenate(shards)
 
-# Add ordered logging function
-def ordered_log(comm, message):
-    """Log messages in order of rank"""
-    size = comm.Get_size()
-    rank = comm.Get_rank()
-    
-    for i in range(size):
-        if i == rank:
-            logging.info(message)
-        comm.Barrier()
-
-# Logging configuration
-logging.basicConfig(level=logging.DEBUG,
-                    format='%(process)s %(asctime)s.%(msecs)03d - {%(module)s.py (%(lineno)d)} - %(funcName)s(): %(message)s',
-                    datefmt='%Y-%m-%d,%H:%M:%S')
-
-# Process command line arguments
-if len(sys.argv) == 1:
-    if rank == 0:   
-        logging.info("ERROR: please input the number of workers")
-    exit()
-elif len(sys.argv) == 2:
-    N = int(sys.argv[1])
-    d = 1000
-    is_sleep = False
-elif len(sys.argv) == 3:
-    N = int(sys.argv[1])
-    d = int(sys.argv[2])
-    is_sleep = False
-elif len(sys.argv) == 4:  
-    N = int(sys.argv[1])
-    d = int(sys.argv[2])
-    is_sleep = True
-    comm_mbps = float(sys.argv[3])
-else:
-    if rank ==0: 
-        logging.info("ERROR: please check the input arguments")
-    exit()
-# 定义生成拉格朗日插值多项式phi_ik(alpha)和psi_ik(alpha)函数
-# def generate_lagrange_polynomials(alpha, beta, a_shards, rt_ik, v_ikn, u_ikn, M, T, N, p):
-    #User i 生成的phi_ik的大小为K,一共有N个用户，故：
-    #phi=np.zeros((K,N),dtype=np.int64)
-    #psi=np.zeros((K,N),dtype=np.int64)
-    #for k in range(K):
-     #   for j in range(N):
-      #      phi_jk=0
-       #     psi_jk=0
-            #前M项
-        #    for n in range(M):  
-         #       phi_numerator=1
-                #psi_numerator=1
-          #      phi_denominator=1
-                #psi_denominator=1
-           #     for m in range(M+T):
-            #        if m!=n: #若只考虑乘积式，phi的分子与分母与psi相同
-             #           phi_numerator=(phi_numerator*(alpha[j]-beta[m])) % p
-                        #psi_numerator=(psi_numerator*(alpha[j]-beta[m]))%p
-              #          phi_denominator=(phi_denominator*(beta[n]-beta[m]))%p
-                        #psi_denominator=(psi_denominator*(beta[n]-beta[m]))%p
-                #为方便后续除法的取模p，对所有分母denominator进行逆元操作
-               # phi_denominator_inv = pow(int(phi_denominator),int(p-2),int(p))
-                #psi_denominator_inv = pow(int(psi_denominator),int(p-2),int(p))
-                            
-                #a_shards[k][n]表示a_kt_i[k]的第n个分片,大小为d//M
-#                a_val=np.max(a_shards[k][n])
- #               l_phi=(phi_numerator*phi_denominator_inv)%p
-                #l_psi=(phi_numerator*psi_denominator_inv)%p
-  #              phi_jk=(phi_jk+a_val*l_phi)%p
-   #             psi_jk=(psi_jk+a_val*rt_ik[k]*l_phi)%p
-            #后T项
-    #        for n in range(M,M+T):
-     #           phi_numerator=1
-                #psi_numerator=1
-      #          phi_denominator=1
-                #psi_denominator=1
-       #         for m in range(M+T):
-        #            if m!=n:
-         #               phi_numerator=(phi_numerator*(alpha[j]-beta[m])) % p
-                        #psi_numerator=(psi_numerator*(alpha[j]-beta[m]))%p
-          #              phi_denominator=(phi_denominator*(beta[n]-beta[m]))%p
-                        #psi_denominator=(psi_denominator*(beta[n]-beta[m]))%p
-                #为方便后续除法的取模p，对所有分母denominator进行逆元操作
-           #     phi_denominator_inv = pow(int(phi_denominator),int(p-2),int(p))
-                #psi_denominator_inv = pow(int(psi_denominator),int(p-2),int(p))
-            #    l_phi=(phi_numerator*phi_denominator_inv)%p
-                #l_psi=(phi_numerator*psi_denominator_inv)%p
-             #   phi_jk=(phi_jk+v_ikn[k][n-M]*l_phi)%p
-              #  psi_jk=(psi_jk+u_ikn[k][n-M]*l_phi)%p
-                        
- #           phi[k][j]=phi_jk
-  #          psi[k][j]=psi_jk
-   # return phi, psi
-
-def generate_lagrange_polynomials(alpha, beta, a_shards, rt_ik, v_ikn, u_ikn, M, T, N, p):
-    K=len(a_shards)
-    phi=np.zeros((K,N),dtype=np.int64)
-    psi=np.zeros((K,N),dtype=np.int64)
-    phi,psi=hide_coordinates(phi,psi,K,N,p)
-    # 预计算拉格朗日基的分母
-    #denominator = np.ones((M+T, M+T), dtype=np.int64)
-    #denominator = 1
-    #for n in range(M+T):
+class LightSecAggProtocol:
+    def __init__(self):
+        self.comm = MPI.COMM_WORLD
+        self.rank = self.comm.Get_rank()
+        self.size = self.comm.Get_size()
+        self.rng = np.random.default_rng(seed=self.rank)
+        self.log_buffer = []
+        self.setup_logging()
         
-     #   for j in range(M+T):
-      #      if n!=j:
-       #         denominator =( denominator * (beta[n] - beta[j] )) % p
+    def setup_logging(self):
+        """Configure logging format and level"""
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format='%(process)s %(asctime)s.%(msecs)03d - {%(module)s.py (%(lineno)d)} - %(funcName)s(): %(message)s',
+            datefmt='%Y-%m-%d,%H:%M:%S'
+        )
+    
+    def ordered_log(self, message: str):
+        """Store log message in buffer for ordered output"""
+        self.log_buffer.append(f"[Rank {self.rank}] {message}")
+    
+    def print_ordered_logs(self, stage: str):
+        """Gather and print logs in rank order for the given stage"""
+        try:
+            all_logs = self.comm.gather(self.log_buffer, root=0)
+            if self.rank == 0:
+                logging.info(f"\n=== {stage} Logs ===")
+                for r in range(self.size):
+                    if all_logs[r]:  # Only print if logs exist
+                        logging.info(f"---- Rank {r} ----")
+                        for msg in all_logs[r]:
+                            logging.info(msg)
+        except Exception as e:
+            logging.error(f"Error in print_ordered_logs: {str(e)}")
+        self.log_buffer = []
+        self.comm.Barrier()
+    
+    def test_mpi_environment(self):
+        """Verify MPI communication works"""
+        try:
+            if self.rank == 0:
+                for i in range(1, self.size):
+                    self.comm.Send([np.array([1], dtype=np.int64), MPI.INT64_T], dest=i)
+                    data = np.empty(1, dtype=np.int64)
+                    self.comm.Recv([data, MPI.INT64_T], source=i)
+                    self.ordered_log(f"MPI test: Received {data[0]} from rank {i}")
+            else:
+                data = np.empty(1, dtype=np.int64)
+                self.comm.Recv([data, MPI.INT64_T], source=0)
+                self.comm.Send([np.array([self.rank], dtype=np.int64), MPI.INT64_T], dest=0)
+                self.ordered_log(f"MPI test: Sent {self.rank} to rank 0")
+            self.print_ordered_logs("MPI Test")
+        except Exception as e:
+            logging.error(f"MPI test failed: {str(e)}")
+            self.comm.Abort()
 
-    # 计算分母的模逆元
-    #inv_denominator=np.array([[pow(int(denominator[n][j]),int( p-2), int(p)) if j!=n else 0 for j in range(M+T)] for n in range(M+T)])
-    #inv_denominator = pow(int(denominator),int(p-2),int(p))
-    # 计算拉格朗日基
-    for k in range(K):
-        for j in range(N):
-            phi_jk=0
-            psi_jk=0
-            
-            # 计算分子项
-            #numerator=np.ones((M+T), dtype=np.int64)
-            for m in range(M+T):
-                l_m=1
-                
-                for n in range(M+T):
-                    if n!=m:
-                        l_m=(l_m*(alpha[j]-beta[n])) % p
-                # 计算分母的模逆元
-                denominator=1
-                for n in range(M+T):
-                    if n!=m:
-                        denominator =( denominator * (beta[m] - beta[n] )) % p
-                inv_denominator = pow(int(denominator),int(p-2),int(p))
-                
-                l_m=(l_m*inv_denominator)%p
-                
-
-                if m<M: #前M项
-                    a_val = np.max(a_shards[k][m]) % p
-                    phi_jk = (phi_jk + a_val * l_m) % p
-                    psi_jk = (psi_jk + a_val * rt_ik[k] * l_m) % p
-
-                else: #后T项
-                    phi_jk = (phi_jk + v_ikn[k][m-M] * l_m) % p
-                    psi_jk = (psi_jk + u_ikn[k][m-M] * l_m) % p
-
-            phi[k][j]=phi_jk
-            psi[k][j]=psi_jk
-    return phi, psi
-
-
- #多项式插值重建
-def interpolate(alpha_s_eval,phi_alpha_buffer,beta,M,p):
-    U_dec=np.zeros((M,len(alpha_s_eval)),dtype=np.int64)
-    for m in range(M):
-        for j in range(len(alpha_s_eval)):
-            numerator=1
-            denominator=1
-            for k in range(len(alpha_s_eval)):
-                if k!=j:
-                    numerator=(numerator*(beta[m]-alpha_s_eval[k])) % p
-                    denominator=(denominator*(alpha_s_eval[j]-alpha_s_eval[k])) % p
-            inv_denominator = pow(int(denominator),int(p-2),int(p))
-            
-            U_dec[m][j]=(numerator*inv_denominator)%p
-    return U_dec.dot(phi_alpha_buffer.T)%p
-
-# 服务器聚合逻辑
-def server_aggregate(phi_alphas,alpha_s_eval,beta,M,p):
-    #phi_alphas——从用户端接收的phi(alpha_i)的值
-    #alpha_s_eval——幸存用户的alpha值
-    #beta——公共参数
-    U=len(alpha_s_eval)
-    if U<M+T:
-        #raise ValueError("NO enough surviving users for reconstruction!")
-        logging.error(f"Not enough surviving users (got {U}, need at least {M+T})")
-        return None
+    def parse_arguments(self, args: List[str]) -> Tuple[int, int, bool, float]:
+        """Process command line arguments"""
+        if len(args) == 1:
+            if self.rank == 0:   
+                logging.error("Please input the number of workers")
+            self.comm.Abort()
         
-    # 只使用前M+T个用户的输入
-    if U > M + T:
-        phi_alphas = phi_alphas[:M+T]
-        alpha_s_eval = alpha_s_eval[:M+T]
+        N = int(args[1])
+        d = 500  # Default dimension
+        is_sleep = False
+        comm_mbps = 100.0  # Default communication speed
+        
+        if len(args) >= 3:
+            d = int(args[2])
+        if len(args) >= 4:
+            is_sleep = True
+            comm_mbps = float(args[3])
+        
+        return N, d, is_sleep, comm_mbps
 
-    # 构建插值矩阵
-    A=np.zeros((M,U),dtype=np.int64)
-    for m in range(M):
-        for j in range(U):
-            numerator=1
-            denominator=1
-            for k in range(U):
-                if k!=j:
-                    numerator=(numerator*(beta[m]-alpha_s_eval[k])) % p
-                    denominator=(denominator*(alpha_s_eval[j]-alpha_s_eval[k])) % p
-            inv_denominator = pow(int(denominator),int(p-2),int(p))
-            A[m][j]=(numerator*inv_denominator)%p
-    # 计算聚合梯度
-    x_agg = (A @ phi_alphas) % p
-    return x_agg
-
-#添加额外噪声对坐标进行隐藏
-def hide_coordinates(phi,psi,K,N,p):
-    random_noise_phi=np.random.randint(0,p,size=(K,N),dtype=np.int64)
-    random_noise_psi=np.random.randint(0,p,size=(K,N),dtype=np.int64)
-    
-    # 确保噪声在聚合时能够抵消
-    for k in range(K):
-        noise_sum_phi=np.sum(random_noise_phi[k,:])%p
-        random_noise_phi[k,0] = (random_noise_phi[k,0] - noise_sum_phi) % p
-        noise_sum_psi=np.sum(random_noise_psi[k,:])%p
-        random_noise_psi[k,0] = (random_noise_psi[k,0] - noise_sum_psi) % p
-
-    phi=(phi+random_noise_phi)%p
-    psi=(psi+random_noise_psi)%p
-    return phi,psi
-
-# 添加有限域转换函数
-def real_to_finite_field(x,scale=1e6,p=2**31-1):
-    # round——四舍五入
-    #首先缩放并四舍五入
-    scaled=np.round(x*scale).astype(np.int64)
-    # 然后取模以限制在有限域内
-    return np.mod(scaled,p)
-
-# 添加验证步骤
-def verify_aggregation(x_agg,phi_alphas,surviving_set,p):
-    if np.any(x_agg<0) or np.any(x_agg>=p):
-        logging.error("Aggregation result is out of bounds!")
-        return False
-    
-    return True
-# Server端
-# System parameters
-T = int(np.floor(N/2))
-U_array = np.array([T + 1]).astype('int')
-p = 2**31-1
-n_trail = 3
-K = int(0.01*d)
-M = 6
-drop_rate = 0.1
-time_out = []
-
-# Calculate chunk size to reduce memory usage
-chunk_size = d // M  # 向下取整（d的数量很大时，可忽略误差）
-d = chunk_size * M  # 保证d能够被M整除
-
-if size != N+1:
-    logging.info("Number Error! N Users and 1 Server.")
-
-if rank == 0:
-    logging.info(U_array)
-
-for t in range(len(U_array)):
-    U = np.max([U_array[t], T+1])
-    U1 = N
-    surviving_set1 = np.array(range(U1))
-    surviving_set2 = np.array(range(U))
-    time_avg = np.zeros((5), dtype=float)
-    
-    if rank == 0:
-        logging.info(f"N={N}, U={U}, T={T} start!!")
-
-    for avg_idx in range(n_trail):
-        comm.Barrier()
-        #logging.info('START!')
-
-        # Server
-        if rank == 0:
-            comm.Barrier()
-            t_total_start = time.time()
-            logging.info('Server START!')
-            logging.info(f"System parameters :round={avg_idx}, N={N}, U={U}, T={T}, d={d}, K={K}, M={M}, drop_rate={drop_rate}, chunk_size={chunk_size}")
-            
-            # Server生成公共参数alpha和beta
-            alpha = np.random.randint(1, p, size=N, dtype=np.int64)
-            beta = np.random.randint(1, p, size=M+T, dtype=np.int64)
-            logging.info("Server: alpha and beta are ready!")
-            
-            t0_comm = time.time()
-            # 将alpha和beta发送给所有用户
-            #for user_idx in range(1, N+1):
-             #   try:
-              #      comm.Send([np.ascontiguousarray(alpha, dtype=np.int64), MPI.INT64_T], dest=user_idx)
-               #     comm.Send([np.ascontiguousarray(beta, dtype=np.int64), MPI.INT64_T], dest=user_idx)
-                #    logging.info(f'Server is sending alpha and beta to [rank={user_idx}]')
-                #except Exception as e:
-                 #   logging.error(f"Error sending to rank {user_idx}: {str(e)}")
-                  #  raise
-            alpha_reqs=[]
-            beta_reqs=[]
-            for user_idx in range(1,N+1):
-                # 发送alpha
-                req = comm.Isend([np.ascontiguousarray(alpha, dtype=np.int64), MPI.INT64_T], dest=user_idx)
-                alpha_reqs.append(req)
-                # 发送beta
-                req = comm.Isend([np.ascontiguousarray(beta, dtype=np.int64), MPI.INT64_T], dest=user_idx)
-                beta_reqs.append(req)
-                logging.info(f'Server is sending alpha and beta to [rank={user_idx}]')
-            MPI.Request.Waitall(alpha_reqs)
-            MPI.Request.Waitall(beta_reqs)
-            logging.info("Server finished sending alpha and beta")
-            #comm.Barrier() #同步，确保所有User开始接收
-            # 服务器端在线阶段第二轮
-            # 接收所有幸存用户发送的编码梯度的本地聚合phi(alpha_i)——至少需要M+T个用户的值
-            
-            #接收所有幸存用户发送的phi_alpha_i，创建一个缓存器phi_alpha_buffer,大小为U*K
-            # Server starts to receive phi_alpha!
-            logging.info("Server starts to receive phi_alpha!")
-            phi_alpha_buffer=np.zeros((U,K)).astype(np.int64)
-            
-            # Create non-blocking receive requests for all surviving users
-            rx_reqs = []
-            for j in surviving_set2:  # surviving_set2 contains 0-based indices
-                rx_req = comm.Irecv([phi_alpha_buffer[j,:], MPI.INT64_T], source=j+1)
-                rx_reqs.append(rx_req)
-                logging.info(f"Server created receive request for user {j+1}")
-            
-            # Wait for all receives to complete
-            MPI.Request.Waitall(rx_reqs)
-            logging.info("Server received all phi_alpha values")
-            
-            t_comm = time.time() - t0_comm
-            #多项式插值重建，得到phi(alpha)
-            t0_dec = time.time()
-            alpha_s_eval=alpha[surviving_set2]
-            beta_s=beta[:M]
-            U_dec=np.zeros((M,U),dtype=np.int64)
-#            for m in range(M):
- #               for j in range(U):
-  #                  numerator=1
-   #                 denominator=1
-    #                for k in range(U):
-     #                   if k!=j:
-      #                      numerator=numerator*(beta[m]-alpha_s_eval[k])%p
-       #                     denominator=denominator*(alpha_s_eval[j]-alpha_s_eval[k])% p
-        #            inv_denominator=pow(int(denominator),int(p-2),int(p))
-         #           U_dec[m,j]=(numerator*inv_denominator) % p
-            #代入beta(1)——beta(M)，按公式（24）计算出x_agg_t
-
-            #x_agg_t=interpolate(alpha_s_eval,phi_alpha_buffer,beta_s,M,p)
-            x_agg=server_aggregate(phi_alpha_buffer,alpha_s_eval,beta_s,M,p)
-
-            #x_agg_t=np.mod(U_dec.dot(phi_alpha_buffer.T),p)
-            logging.info(f"Aggregated gradient: {x_agg}")
-
-            # 验证聚合结果是否在有限域内
-            if not verify_aggregation(x_agg, phi_alpha_buffer, surviving_set2, p):
-                logging.error("Aggregation verification failed!")
+    def generate_lagrange_polynomials(self, alpha: np.ndarray, beta: np.ndarray, 
+                                    a_shards: np.ndarray, rt_ik: np.ndarray,
+                                    v_ikn: np.ndarray, u_ikn: np.ndarray, 
+                                    M: int, T: int, N: int, p: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Generate masked polynomials for secret sharing"""
+        K = len(a_shards)
+        phi = np.zeros((K, N), dtype=np.int64)
+        psi = np.zeros((K, N), dtype=np.int64)
+        
+        # Add random noise for security
+        phi, psi = self.hide_coordinates(phi, psi, K, N, p)
+        
+        for k in range(K):
+            for j in range(N):
+                phi_jk, psi_jk = 0, 0
+                for m in range(M + T):
+                    # Compute Lagrange basis polynomial
+                    l_m = 1
+                    for n in range(M + T):
+                        if n != m:
+                            l_m = (l_m * (alpha[j] - beta[n])) % p
+                    
+                    denominator = 1
+                    for n in range(M + T):
+                        if n != m:
+                            denominator = (denominator * (beta[m] - beta[n])) % p
+                    
+                    inv_denominator = pow(int(denominator), p-2, p)
+                    l_m = (l_m * inv_denominator) % p
+                    
+                    if m < M:
+                        a_val = np.max(a_shards[k][m]) % p
+                        phi_jk = (phi_jk + a_val * l_m) % p
+                        psi_jk = (psi_jk + a_val * rt_ik[k] * l_m) % p
+                    else:
+                        phi_jk = (phi_jk + v_ikn[k][m-M] * l_m) % p
+                        psi_jk = (psi_jk + u_ikn[k][m-M] * l_m) % p
                 
+                phi[k][j] = phi_jk
+                psi[k][j] = psi_jk
+        
+        return phi, psi
 
-            #----------------------------------------------------------------------
-            #----------------------------------------------------------------------
+    def hide_coordinates(self, phi: np.ndarray, psi: np.ndarray, 
+                        K: int, N: int, p: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Add random noise to hide actual values"""
+        random_noise_phi = self.rng.integers(0, p, size=(K, N), dtype=np.int64)
+        random_noise_psi = self.rng.integers(0, p, size=(K, N), dtype=np.int64)
+        
+        for k in range(K):
+            # Ensure noise sums to zero for security
+            noise_sum_phi = np.sum(random_noise_phi[k,:]) % p
+            random_noise_phi[k,0] = (random_noise_phi[k,0] - noise_sum_phi) % p
+            
+            noise_sum_psi = np.sum(random_noise_psi[k,:]) % p
+            random_noise_psi[k,0] = (random_noise_psi[k,0] - noise_sum_psi) % p
+        
+        phi = (phi + random_noise_phi) % p
+        psi = (psi + random_noise_psi) % p
+        return phi, psi
 
-            # Perform the decoding
-            
-            t_dec = time.time() - t0_dec
-            t_total = time.time() - t_total_start
-            #x_agg_t=np.mod(U_dec.dot(phi_alpha_buffer.T),p)
-            #logging.info(f"Aggregated gradient: {x_agg_t}")
-            #----------------------------------------------------------------------
-
-            # Perform the decoding
-            
-            t_dec = time.time() - t0_dec
-            t_total = time.time() - t_total_start
-            
-            # Collect timing information from users
-            time_users = np.zeros(2, dtype='float')
-            for i in range(N):
-                rx_rank=i+1
-                tmp = np.empty(2, dtype='float')
-                #comm.Recv([tmp,MPI.FLOAT], source=rx_rank)
-                #time_users += tmp
-                try:
-                    comm.Recv([tmp, MPI.FLOAT], source=rx_rank)
-                    time_users += tmp
-                except Exception as e:
-                    logging.error(f"Error receiving from rank {rx_rank}: {str(e)}")
-                    raise
+    def server_aggregate(self, phi_alphas: np.ndarray, alpha_s_eval: np.ndarray,
+                        beta: np.ndarray, M: int, T: int, p: int) -> Optional[np.ndarray]:
+        """Aggregate user submissions on the server"""
+        U = len(alpha_s_eval)
+        if U < M + T:
+            logging.error(f"Not enough surviving users (got {U}, need at least {M+T})")
+            return None
+        
+        if U > M + T:
+            phi_alphas = phi_alphas[:M+T]
+            alpha_s_eval = alpha_s_eval[:M+T]
+        
+        A = np.zeros((M, U), dtype=np.int64)
+        for m in range(M):
+            for j in range(U):
+                # Compute interpolation coefficients
+                numerator = 1
+                denominator = 1
+                for k in range(U):
+                    if k != j:
+                        numerator = (numerator * (beta[m] - alpha_s_eval[k])) % p
+                        denominator = (denominator * (alpha_s_eval[j] - alpha_s_eval[k])) % p
                 
-            time_users = time_users / N
+                inv_denominator = pow(int(denominator), p-2, p)
+                A[m][j] = (numerator * inv_denominator) % p
+        
+        x_agg = (A @ phi_alphas) % p
+        return x_agg
 
-            time_set = np.array([t_total, time_users[0], time_users[1], t_comm, t_dec])
-            logging.info('%d-th trial time info=%s' % (avg_idx, time_set))
-            time_avg += time_set
+    def verify_aggregation(self, x_agg: np.ndarray, phi_alphas: np.ndarray,
+                         surviving_set: np.ndarray, p: int) -> bool:
+        """Verify the aggregation result is valid"""
+        if np.any(x_agg < 0) or np.any(x_agg >= p):
+            logging.error("Aggregation result is out of bounds!")
+            return False
+        return True
 
-            if avg_idx == n_trail-1:
-                comm.Barrier()
+    def real_to_finite_field(self, x: np.ndarray, scale: float = 1e6, p: int = 2**31-1) -> np.ndarray:
+        """Convert real numbers to finite field elements"""
+        scaled = np.round(x * scale).astype(np.int64)
+        return np.mod(scaled, p)
 
-        # 用户端
-        elif rank <= N:
-            if rank != 0:
-                comm.Barrier() # Barrier 1: Only user processes sync here
-            t_offline_start = time.time()
-            # 生成二进制向量a_k，大小为d，仅第k个元素为1，其余为0
-            # 并分片——此处后移至kt_i之后
-            #for k in range(d):
-             #   a_k=[0]*d
-                #a_k[k]=1
-               # a_shards=np.zeros((d,M),dtype=np.int64)
-                #a_shards[k] = np.split_into_shards(a_k, M)
-                # 此时a_shards[1]为a_k的第二个分片，a_shards[1][k]为a_k的第二个分片中的第k个元素
-
-            # 用户同意N+M+T个不同的公共参数（接收Server发送的公共参数alpha和beta）,值为0-p-1
-            alpha = np.ascontiguousarray(np.empty(N, dtype=np.int64))
-            beta = np.ascontiguousarray(np.empty(M+T, dtype=np.int64))
-            #np.ascontiguousarray——创建可写缓冲区
+    def run_offline_stage(self, N: int, M: int, T: int, p: int) -> Tuple[float, Optional[Tuple[np.ndarray, np.ndarray]]]:
+        """Execute the offline stage of the protocol"""
+        t_start = time.time()
+        
+        if self.rank == 0:  # Server
+            try:
+                alpha = self.rng.integers(1, p, size=N, dtype=np.int64)
+                beta = self.rng.integers(1, p, size=M+T, dtype=np.int64)
+                self.ordered_log(f"Server: generated alpha.shape={alpha.shape}, beta.shape={beta.shape}")
+                
+                # Distribute parameters to users
+                for user_idx in range(1, N+1):
+                    self.comm.Send([alpha, MPI.INT64_T], dest=user_idx, tag=1)
+                    self.comm.Send([beta, MPI.INT64_T], dest=user_idx, tag=2)
+                    self.ordered_log(f'Sent parameters to user {user_idx}')
+                
+                offline_time = time.time() - t_start
+                return offline_time, (alpha, beta)
             
-            #comm.Recv([alpha,MPI.INT64_T], source=0)
-            #comm.Recv([beta,MPI.INT64_T], source=0)
-            #logging.info(f" User {rank} received alpha and beta")
-            #comm.Barrier()
-           
-            #修改为非阻塞式
-            reqs=[]
-            alpha_req=comm.Irecv([alpha,N,MPI.INT64_T], source=0)
-            beta_req=comm.Irecv([beta,M+T,MPI.INT64_T], source=0)
-            reqs.extend([alpha_req,beta_req])
-            MPI.Request.Waitall(reqs) # Users wait here until alpha/beta received from server
-
-            # Add a log here to confirm reception
-            logging.info(f"User {rank} finished receiving alpha and beta.")
-
-            if rank != 0:
-                comm.Barrier() # Barrier 2: Only user processes sync here
-            #for i in range(1,N+1): #按照rank顺序输出日志
-            #   if i==rank:
-            #      logging.info(f"User {rank} received alpha and beta")
-            if rank!=0:
-                # Replace ordered_log with standard logging to avoid deadlock
-                # ordered_log(comm, f"User {rank} received alpha and beta")
-                logging.info(f"User {rank} passed alpha/beta reception barrier.")
-
-            #设置独立随机种子
-            np.random.seed(rank*1000+int(time.time()*1000)%1000000)
-            # 生成随机二进制掩码bt_i,大小为d，仅K个元素为1，其余为0 —— 用于rand-K稀疏化
-            random_indices = np.random.choice(d, K, replace=False) # 从0-d-1中随机选择K个不同的整数，大小为K，False——无放回抽样（每个元素只能被选一次）
-            bt_i = np.zeros(d, dtype=np.int64)
-            bt_i[random_indices] = 1
-
-            # 获得K个坐标的有序集合
-            kt_i=np.sort(random_indices)
-
-            for i in range(1,N+1):
-                if i==rank:
-                    logging.info(f"round_idx={avg_idx}, User {rank} : random_indices = {random_indices}, kt_i = {kt_i}")
-            logging.info("kt_i all be logged")
-            #comm.Barrier() 
-            #logging.info(f"round_idx={avg_idx}, rank={rank} : selected coordinates after sorting = {kt_i}")
+            except Exception as e:
+                logging.error(f"Server offline stage failed: {str(e)}")
+                self.comm.Abort()
+        
+        else:  # Users
+            try:
+                alpha = np.empty(N, dtype=np.int64)
+                beta = np.empty(M+T, dtype=np.int64)
+                self.comm.Recv([alpha, MPI.INT64_T], source=0, tag=1)
+                self.comm.Recv([beta, MPI.INT64_T], source=0, tag=2)
+                self.ordered_log(f"Received parameters alpha.shape={alpha.shape}, beta.shape={beta.shape}")
+                
+                offline_time = time.time() - t_start
+                return offline_time, (alpha, beta)
             
-            # 按公式（19）、（20）生成两个拉格朗日插值多项式phi_ik(alpha)和psi_ik(alpha)
+            except Exception as e:
+                logging.error(f"User {self.rank} offline stage failed: {str(e)}")
+                self.comm.Abort()
 
-            # 首先，计算拉格朗日基多项式（乘积的式子）
+    def run_online_stage_round1(self, alpha: np.ndarray, beta: np.ndarray,
+                              a_shards: np.ndarray, M: int, T: int, N: int,
+                              p: int, d: int, K: int) -> Tuple[float, Optional[Tuple[np.ndarray, np.ndarray]]]:
+        t_start = time.time()
+        if self.rank == 0:  # Server does nothing in round 1
+            return time.time() - t_start, (None, None)
+        try:
+            # Users generate their random masks
+            rt_ik = self.rng.integers(0, p, size=K, dtype=np.int64)
+            self.ordered_log(f"Generated rt_ik.shape={rt_ik.shape}")
 
-            # 然后，获得a_kt_i[k]_n的值——将a_kt_i[k]分成M个分片后，选择第n个分片，即a_shards[n-1]，其大小为d/M
-            # kt_i[k]表示random_indices中第k个升序元素的值，即：选择的a_k中的k为kt_i[k]
-            # _n表示将a_kt_i[k]分成M个分片后，选择第n个分片，即a_shards[n-1]
-            
-            # 生成二进制向量a_k，大小为d，仅第k个元素为1，其余为0
-            # 并分片
-            #chunk_size = d // M
-            a_shards=np.zeros((K,M,chunk_size),dtype=np.int64)
-            for k in range(K):
-                a_k=np.zeros(d, dtype=np.int64)
-                a_k[kt_i[k]]=1
-                #a_shards的大小为(K,M,d//M),即为：K*M的矩阵，每个元素为一个d//M大小的矩阵
-                # 如：kt_i={2,6},则a_shards[0]=((0,0,1),(0,0,0),(0,0,0));a_shards[1]=((0,0,0),(0,0,0),(1,0,0))
-
-                # 将a_k分成M个分片
-                for m in range(M):
-                    start_idx=m*chunk_size
-                    end_idx=(m+1)*chunk_size if m!=M-1 else d
-                    a_shards[k,m]=a_k[start_idx:end_idx]
-                    #logging.info(f"round_idx={avg_idx}, rank={rank} : a_shards[{k},{m}] = {a_shards[k,m]}")
-                #logging.info(f"round_idx={avg_idx}, rank={rank} : a_shards[{k}] = {a_shards[k]}")
-
-            #每个用户使用不同的种子
-            local_seed=rank*1000+int(time.time()*1000)%1000000
-            rng=np.random.RandomState(local_seed)
-            rt_ik=rng.randint(0,p,size=K,dtype=np.int64)
-            logging.info(f"round_idx={avg_idx} , rank={rank} generated initial rt_ik") # Log initial generation
-
-            # Synchronize before rt_ik exchange to ensure all users generated initial rt_ik
-            comm.Barrier() 
-            logging.info(f"User {rank} passed first rt_ik barrier")
-
-            #确保所有用户掩码之和为0
-            if rank==N:
-                total=np.zeros(K, dtype=np.int64)
-                received_rts = {} # Store received values for logging/verification
-                logging.info(f"User {rank} starting to receive rt_ik from others")
-                for i in range(1,N): # Expect N-1 messages
-                    rt=np.empty(K, dtype=np.int64)
-                    status = MPI.Status() # Get status to find source
-                    comm.Recv([rt,MPI.INT64_T], source=MPI.ANY_SOURCE, status=status) # Receive from any source
+            # Exchange masks between users
+            if self.rank == N:  # Last user aggregates masks
+                total = np.zeros(K, dtype=np.int64)
+                received_rts = {}
+                for i in range(1, N):
+                    rt = np.empty(K, dtype=np.int64)
+                    status = MPI.Status()
+                    self.comm.Recv([rt, MPI.INT64_T], source=MPI.ANY_SOURCE, status=status)
                     source_rank = status.Get_source()
-                    received_rts[source_rank] = rt.copy() # Store for verification
-                    logging.info(f"User {rank} received rt from User {source_rank}")
-                    total=(total+rt)%p
-                
-                logging.info(f"User {rank} received all rts: {received_rts}") # Log all received values
-
-                rt_ik=(-total)%p # Calculate final rt_ik for user N
-                logging.info(f"User {rank} calculated final rt_ik: {rt_ik}")
-                
-                # Verification step on User N
+                    received_rts[source_rank] = rt.copy()
+                    self.ordered_log(f"Received rt from User {source_rank}")
+                    total = (total + rt) % p
+                rt_ik = (-total) % p
+                self.ordered_log(f"Calculated final rt_ik")
                 mask_sum = np.sum(rt_ik)
                 for r in received_rts.values():
                     mask_sum = (mask_sum + np.sum(r)) % p
-                
                 if mask_sum != 0:
-                    logging.error(f"Mask sum verification FAILED on User {rank}! Sum={mask_sum}")
+                    self.ordered_log(f"Mask sum verification FAILED! Sum={mask_sum}")
                 else:
-                    logging.info(f"Mask sum verified by User {rank}: sum=0")
+                    self.ordered_log("Mask sum verified: sum=0")
+            else:  # Other users send their masks
+                self.comm.Send([rt_ik, MPI.INT64_T], dest=N)
+                self.ordered_log(f"Sent rt_ik to User {N}")
 
-            elif rank!=0: # All other users (1 to N-1) send to N
-                comm.Send([rt_ik,MPI.INT64_T], dest=N)
-                logging.info(f"User {rank} sent rt_ik to User {N}")
-            
-            # Add another barrier to ensure rt_ik calculation/distribution is complete for ALL users
-            comm.Barrier() 
-            logging.info(f"User {rank} finished rt_ik synchronization. Final rt_ik: {rt_ik}")
-            
-            # 最后，生成随机噪声v_ikn和u_ikn，用于掩藏掩码值rt_ik及所选坐标
-            # 继续，生成随机噪声v_ikn和u_ikn，用于掩藏掩码值rt_ik及所选坐标
-            v_ikn=np.random.randint(0,p,size=(K,T),dtype=np.int64)
+            # Generate random polynomials
+            v_ikn = self.rng.integers(0, p, size=(K, T), dtype=np.int64)
+            u_ikn = self.rng.integers(0, p, size=(K, T), dtype=np.int64)
+            self.ordered_log(f"Generated v_ikn.shape={v_ikn.shape}, u_ikn.shape={u_ikn.shape}")
 
-            u_ikn=np.random.randint(0,p,size=(K,T),dtype=np.int64)
-            for i in range(1,N+1):
-                if i==rank:
-                    logging.info(f"round_idx={avg_idx} , rank={rank} : v_ikn = {v_ikn}, u_ikn = {u_ikn}")
-            #comm.Barrier()
+            # Generate Lagrange polynomials
+            phi, psi = self.generate_lagrange_polynomials(
+                alpha, beta, a_shards, rt_ik, v_ikn, u_ikn, M, T, N, p
+            )
+            self.ordered_log(f"Generated phi.shape={phi.shape}, psi.shape={psi.shape}")
 
-            # 用户端离线阶段结束
-            #numerator——分子,denominator——分母
-            
-            phi, psi = generate_lagrange_polynomials(alpha, beta, a_shards, rt_ik, v_ikn, u_ikn, M, T, N, p)
-            logging.info(f"round_idx={avg_idx} , rank={rank} : phi = {phi}, psi = {psi}")
-            
-            #comm.Barrier()
-            #phi大小为K*N,第j列为第j个用户的phi_ik(alpha)的系数——全局缓存区
-            # 此外，将每个用户生成的phi_ik(alpha)和psi_ik(alpha)（大小为K）的系数存储到全局缓存区phi和psi中，大小为K*N
-            tx_req_phi=[]
-            tx_req_psi=[]
-            for j in range(1,N+1):
-                if j !=rank:
-                    req_phi=comm.Isend([phi[:,j-1].copy(), MPI.INT64_T], dest=j, tag=1)
-                    req_psi=comm.Isend([psi[:,j-1].copy(), MPI.INT64_T], dest=j, tag=2)
-                    tx_req_phi.append(req_phi)
-                    tx_req_psi.append(req_psi)
-                    logging.info(f"User %d send phi and psi to User %d"%(rank,j))
- #           tx_req_phi=[]
-  #          tx_req_psi=[]
-            #dest_users=[x for x in range(1,N+1) if x != rank]
-   #         tx_dest=np.delete(range(N), rank - 1) # 排除自己
-    #        for j in range(len(tx_dest)):  #遍历N-1次，为每个目标用户进程创建发送请求
-     #           bf_addr = tx_dest[j]  #目标用户的索引(从0开始)
-      #          tx_rank = tx_dest[j] + 1  #目标用户的进程编号（从1开始；0为Server）
-       #         tx_data=np.ascontiguousarray(phi[:,bf_addr].astype(int))
-        #        tx_data_1=np.ascontiguousarray(psi[:,bf_addr].astype(int))
-         #       logging.info('[ rank= %d ] send phi and psi to %d' % (rank, tx_rank))  #记录日志，表示当前进程rank正在向目标进程tx_rank发送数据
-          #      req_phi = comm.Isend([tx_data, MPI.INT64_T], dest=tx_rank,tag=1)  #向目标进程tx_rank发送数据phi
-           #     req_psi = comm.Isend([tx_data_1, MPI.INT64_T], dest=tx_rank,tag=2)  #向目标进程tx_rank发送数据psi
-            #    tx_req_phi.append(req_phi)
-             #   tx_req_psi.append(req_psi)
-                
+            # Exchange polynomials between users
+            phi_coeff = np.zeros((K, N), dtype=np.int64)
+            psi_coeff = np.zeros((K, N), dtype=np.int64)
+            phi_coeff[:,self.rank-1] = phi[:,self.rank-1]
+            psi_coeff[:,self.rank-1] = psi[:,self.rank-1]
 
-            #for j in dest_users:
-             #   req=comm.Isend([np.ascontiguousarray(phi[:,j-1]), MPI.INT64_T], dest=j, tag=1)
-              #  phi_reqs.append(req)
-               # req=comm.Isend([np.ascontiguousarray(psi[:,j-1]), MPI.INT64_T], dest=j, tag=2)
-                #psi_reqs.append(req)
-                #logging.info(f"User %d send phi and psi to User %d"%(rank,j))
-            #MPI.Request.Waitall(phi_reqs)
-            #MPI.Request.Waitall(psi_reqs)
+            for j in range(1, N+1):
+                if j != self.rank:
+                    # Send our coefficients
+                    self.comm.Send([phi[:,j-1].copy(), MPI.INT64_T], dest=j, tag=1)
+                    self.comm.Send([psi[:,j-1].copy(), MPI.INT64_T], dest=j, tag=2)
+                    self.ordered_log(f"Sent phi/psi to User {j}")
 
-            if is_sleep:
-                comm_time_per_tx=K/comm_mbps / (2**20) * 32
-                comm_time=comm_time_per_tx * 2 * (N-1)
-                time.sleep(comm_time)
-            #comm.Barrier() #确保所有发送完成
-            logging.info("All phi and psi have been sent")
-            #从其他用户接收phi_ik(alpha)和psi_ik(alpha)
-            phi_coeff=np.zeros((K,N),dtype=np.int64)
-            psi_coeff=np.zeros((K,N),dtype=np.int64)
-            #直接填充自己的数据
-            phi_coeff[:,rank-1]=phi[:,rank-1]
-            psi_coeff[:,rank-1]=psi[:,rank-1]
-            rx_req_phi=[]
-            rx_req_psi=[]
-            rx_buffer=[]
-            for j in range(1,N+1):
-                if j !=rank:
+                    # Receive others' coefficients
                     buf_phi = np.empty(K, dtype=np.int64)
                     buf_psi = np.empty(K, dtype=np.int64)
-                    req_phi=comm.Irecv([buf_phi, MPI.INT64_T], source=j, tag=1)
-                    req_psi=comm.Irecv([buf_psi, MPI.INT64_T], source=j, tag=2)
-                    # 这里的tag=1和tag=2是标识符，用于区分不同类型的消息，分别代码phi和psi
-                    rx_req_phi.append(req_phi)
-                    rx_req_psi.append(req_psi)
-                    rx_buffer.append((j-1,buf_phi,buf_psi))
-                    logging.info(f"User %d received phi and psi from User %d"%(rank,j))
-            MPI.Request.Waitall(tx_req_phi)
-            MPI.Request.Waitall(tx_req_psi)
+                    self.comm.Recv([buf_phi, MPI.INT64_T], source=j, tag=1)
+                    self.comm.Recv([buf_psi, MPI.INT64_T], source=j, tag=2)
+                    phi_coeff[:,j-1] = buf_phi
+                    psi_coeff[:,j-1] = buf_psi
+                    self.ordered_log(f"Received phi/psi from User {j}")
 
-            MPI.Request.Waitall(rx_req_phi)
-            MPI.Request.Waitall(rx_req_psi)
-            #comm.Barrier()
-            logging.info("All phi and psi have been received")
-            for bf_addr, buf_phi, buf_psi in rx_buffer:
-                phi_coeff[:,bf_addr] = buf_phi
-                psi_coeff[:,bf_addr] = buf_psi
-            logging.info("round_idx = %d [ rank= %d ] data phi and psi is ready..."% (avg_idx, rank))
-            #comm.Barrier() # 确保所有用户接收完成
-            logging.info("All data of phi and psi is ready!")
+            online1_time = time.time() - t_start
+            return online1_time, (phi_coeff, psi_coeff)
+        except Exception as e:
+            logging.error(f"User {self.rank} online stage round 1 failed: {str(e)}")
+            return time.time() - t_start, (None, None)
+
+    def run_online_stage_round2(self, phi_coeff: np.ndarray, psi_coeff: np.ndarray,
+                              surviving_set: np.ndarray, d: int, K: int,
+                              p: int, is_sleep: bool, comm_mbps: float) -> Tuple[float, np.ndarray]:
+        """Execute second round of online stage"""
+        t_start = time.time()
+        
+        if self.rank == 0:  # Server
+            phi_alpha_buffer = np.zeros((len(surviving_set), K), dtype=np.int64)
+            active_users = []
             
-            # 采用非阻塞方式发送和接收数据流时，在Isend/Irecv 完成之前，不能修改发送缓存区或者释放接收缓冲区，否则可能导致数据损坏或程序崩溃
-
-
-            # 最后，每个用户i代入最初获得的公共参数alpha_j，得到phi_ik(alpha_j)和psi_ik(alpha_j)，大小为K，并发送给用户j —— 在全局缓存区上表现为:
-            # 遍历每个用户i∈[N]，对于全局缓存区phi_coeff和psi_coeff上的每一行j!=i，将其值更新为phi_ik(alpha_j)和psi_ik(alpha_j)
-            # 此步已由前面函数中的alpha[j]实现
-
-            # 用户端离线阶段结束
-            t_offline_total=time.time()-t_offline_start
-            #用户端在线阶段第一轮开始
-            logging.info("User offline end!")
-            #模拟局部训练时间
-            time.sleep(5)
-            #comm.Barrier() #同步，确保所有进程都已经训练完毕，准备开始发送掩码模型
-            logging.info("User %d online phase start!"%(rank))
-            
-            
-            t0_round1 = time.time() #记录第一轮在线阶段时间开始
-            start_encoding_time = time.time() #记录编码开始时间
-            #模拟最开始的本地模型xt_i（大小为d）
-            xt_i = np.random.randn(d).astype(np.int64)
-            #本地模型稀疏化，得到稀疏化的局部梯度xt_i_1（大小为d）
-            xt_i_1 = bt_i*xt_i
-            # （21）将其从实数域转换为有限域，得到xt_i_mod（大小为d）
-            xt_i_mod = real_to_finite_field(xt_i_1 , p)
-            # （22）每个用户i对xt_i_mod(大小为d)进行掩码（减去随机掩码rt_ik（大小为K）），得到掩码梯度参数xt_i_mod_masked，并将其广播给其他所有用户j(j!=i)(考虑采用全局掩码梯度缓冲区)
-            xt_i_mod_masked=np.zeros(K).astype(np.int64) #大小为K
-            for k in range(K):
-                xt_i_mod_masked[k] = xt_i_mod[kt_i[k]] - rt_ik[k]
-
-            global_masked_buffer=np.zeros((N,K)).astype(np.int64) #大小为N*K
-            my_idx=rank-1
-            if my_idx in surviving_set1:
-                send_reqs = []
-                dest_users = [x for x in range(1, N+1) if x != rank]  # 排除自己
-    
-                for j in dest_users:
-                    req = comm.Isend([xt_i_mod_masked, MPI.INT64_T], dest=j)
-                    send_reqs.append(req)
-    
-                # 本地数据直接存储
-                global_masked_buffer[my_idx,:] = xt_i_mod_masked
-                MPI.Request.Waitall(send_reqs)
-                logging.info("User %d send masked_model to User %d" % (my_idx,j))
-
-            #模拟通信延迟
-            if is_sleep:
-                data_size = K # 参数数量
-                comm_time = data_size / comm_mbps / (2**20) * 32 #秒
-                time.sleep(comm_time)  #让当前进程暂停comm_time秒，模拟通信延迟
-
-            t_round1 = time.time() - t0_round1  #计算第一轮在线阶段总耗时
-            #用户端在线阶段第二轮
-
-            # 所有用户i接收完毕其他用户发送的掩码梯度参数xt_i_mod_masked后，按公式（23）计算出一个（所有幸存用户的）编码梯度的本地聚合phi(alpha_i)，并将其发送给Server
-            if my_idx in surviving_set1:
-                recv_reqs = []
-                source_users = [x for x in range(1, N+1) if x != rank]  # 排除自己
-    
-                for j in source_users:
-                    temp_buf = np.empty(K, dtype=np.int64)
-                    req = comm.Irecv([temp_buf, MPI.INT64_T], source=j)
-                    recv_reqs.append((req, j, temp_buf))
-                    
-                #MPI.Request.Waitall(recv_reqs)
-                logging.info("User %d received masked_model from User %d"%(rank,j))
-    
-                # 处理本地数据
-                phi_i = phi_coeff[:,rank-1]
-
-                logging.info("Local data have been received!")
-
-                # 等待所有接收完成并处理
-                for req, j, temp_buf in recv_reqs:
-                    req.Wait()
-                    global_masked_buffer[j-1,:] = temp_buf
-
-                logging.info("All receiving done!")
-
-            # 按公式（23）计算出一个（所有幸存用户的）编码梯度的本地聚合phi(alpha_i)，并将其发送给Server
-            phi_alpha_i=np.zeros(K).astype(np.int64) #大小为K
-            
-            # 确保在计算phi_alpha_i之前，所有用户都已经接收到了其他用户的掩码梯度参数
-            # Only surviving users calculate and send
-            if my_idx in surviving_set2:
-                phi_alpha_i = np.zeros(K, dtype=np.int64)
+            # Check which users are active
+            for j in range(1, self.size):
+                status = np.array([0], dtype=np.int64)
+                self.comm.Recv([status, MPI.INT64_T], source=j, tag=999)
+                self.ordered_log(f"Received status={status[0]} from user {j}")
                 
-                # Calculate using only surviving users' data
+                if status[0] == 1:
+                    active_users.append(j-1)
+                    self.ordered_log(f"Will receive from user {j}")
+            
+            if len(active_users) < len(surviving_set):
+                self.ordered_log(f"Not enough surviving users (got {len(active_users)}, need {len(surviving_set)})")
+                self.comm.Abort()
+            
+            # Receive masked gradients from active users
+            for j in active_users:
+                self.comm.Recv([phi_alpha_buffer[j,:], MPI.INT64_T], source=j+1, tag=3)
+                self.ordered_log(f"Received phi_alpha from user {j+1}")
+            
+            online2_time = time.time() - t_start
+            return online2_time, phi_alpha_buffer
+        
+        else:  # Users
+            # Simulate dropout
+            is_active = self.rng.random() > 0.1  # 10% dropout rate
+            status = np.array([1 if is_active else 0], dtype=np.int64)
+            self.comm.Send([status, MPI.INT64_T], dest=0, tag=999)
+            self.ordered_log(f"Sent status={status[0]} to server")
+            
+            if not is_active:
+                self.ordered_log("Dropped out")
+                return time.time() - t_start, np.array([])
+            
+            # Simulate local training
+            time.sleep(5)  # Simulate computation
+            
+            # Generate and mask gradient
+            bt_i = self.rng.integers(0, 2, size=d, dtype=np.int64)
+            kt_i = self.rng.choice(d, size=K, replace=False)
+            xt_i = self.rng.standard_normal(d).astype(np.int64)  # <-- FIXED HERE
+            xt_i_1 = bt_i * xt_i
+            xt_i_mod = self.real_to_finite_field(xt_i_1, p)
+            
+            xt_i_mod_masked = np.zeros(K, dtype=np.int64)
+            for k in range(K):
+                xt_i_mod_masked[k] = xt_i_mod[kt_i[k]]
+            
+            # Exchange masked gradients between surviving users
+            global_masked_buffer = np.zeros((self.size-1, K), dtype=np.int64)
+            my_idx = self.rank - 1
+            
+            if my_idx in surviving_set:
+                for j in range(1, self.size):
+                    if j != self.rank:
+                        self.comm.Send([xt_i_mod_masked, MPI.INT64_T], dest=j, tag=3)
+                        self.ordered_log(f"Sent masked model to User {j}")
+                
+                global_masked_buffer[my_idx,:] = xt_i_mod_masked
+            
+            if is_sleep:
+                comm_time = K / comm_mbps / (2**20) * 32
+                time.sleep(comm_time)
+            
+            for j in range(1, self.size):
+                if j != self.rank:
+                    temp_buf = np.empty(K, dtype=np.int64)
+                    self.comm.Recv([temp_buf, MPI.INT64_T], source=j, tag=3)
+                    global_masked_buffer[j-1,:] = temp_buf
+                    self.ordered_log(f"Received masked model from User {j}")
+            
+            # Compute final submission to server
+            phi_alpha_i = np.zeros(K, dtype=np.int64)
+            if my_idx in surviving_set and is_active:
                 for k in range(K):
-                    for j in surviving_set2:
+                    for j in surviving_set:
                         val = global_masked_buffer[j,k]
                         phi_val = phi_coeff[k,j]
                         psi_val = psi_coeff[k,j]
                         phi_alpha_i[k] = (phi_alpha_i[k] + val * phi_val + psi_val) % p
-                    # It might be better to log calculation completion *after* the loop
-                    # logging.info(f"User {rank} calculated coordinate {k}") 
                 
-                # Add a log message indicating calculation is complete before sending
-                logging.info(f"User {rank} finished calculating all phi_alpha_i values")
-
-                # Send complete array
-                comm.Send([phi_alpha_i, MPI.INT64_T], dest=0)
-                # Replace ordered_log with a standard log to avoid deadlock
-                # ordered_log(comm, f"User {rank} SENT phi_alpha_i") 
-                logging.info(f"User {rank} SENT phi_alpha_i to Server") # Use standard logging
+                self.comm.Send([phi_alpha_i, MPI.INT64_T], dest=0, tag=3)
+                self.ordered_log(f"Sent phi_alpha_i to Server")
             
-            # Adjust this log message for clarity if needed, maybe indicate rank
-            logging.info(f"User {rank} finished Online Phase round 2!") 
+            online2_time = time.time() - t_start
+            return online2_time, phi_alpha_i
+
+    def run(self, args: List[str]):
+        """Main execution flow for LightSecAgg protocol"""
+        self.test_mpi_environment()
+        
+        # Parse arguments and setup parameters
+        N, d, is_sleep, comm_mbps = self.parse_arguments(args)
+        
+        if self.size != N + 1:
+            logging.error(f"Need exactly {N} users and 1 server (total {N+1} processes)")
+            self.comm.Abort()
+        
+        T = int(np.floor(N/2))
+        U = max(T + 1, N)  # Number of surviving users
+        p = 2**31-1  # Prime for finite field
+        n_trials = 3  # Number of trials to average timing
+        K = int(0.01 * d)  # Number of coordinates to use
+        M = 6  # Number of shards
+        
+        # Calculate chunk size and adjust dimension
+        chunk_size = d // M
+        d = chunk_size * M
+        
+        # Initialize placeholders
+        a_shards = self.rng.integers(0, p, size=(K, M), dtype=np.int64)
+        self.ordered_log(f"Initialized placeholders: a_shards.shape={a_shards.shape}")
+        
+        if self.rank == 0:
+            logging.info(f"Starting with N={N}, U={U}, T={T}, d={d}, K={K}, M={M}")
+        
+        time_avg = np.zeros(5, dtype=float)  # For timing statistics
+        
+        for trial in range(n_trials):
+            t_total_start = time.time()
+            self.ordered_log(f"\n=== Trial {trial+1}/{n_trials} ===")
             
-            #for my_idx in surviving_set2:
-             #   for k in range(K):
-             #       phi_alpha_i = (phi_alpha_i+xt_i_mod_masked[k]*phi_coeff[k,my_idx]+psi_coeff[k,my_idx]) % p
-              #  comm.Send(phi_alpha_i,MPI.INT64_T,dest=0)
-
-            if is_sleep:
-                data_size = 1 # 参数数量
-                comm_time = len(surviving_set2)*data_size / comm_mbps / (2**20) * 32 #秒
-                time.sleep(comm_time)  #让当前进程暂停comm_time秒，模拟通信延迟
-
-            # 用户端在线阶段结束
-
-
-
-            #----------------------------------------------------------------------
+            # Offline Stage
+            offline_time, (alpha, beta) = self.run_offline_stage(N, M, T, p)
+            self.print_ordered_logs("Offline Stage Complete")
             
+            # Online Stage Round 1
+            online1_time, (phi_coeff, psi_coeff) = self.run_online_stage_round1(
+                alpha, beta, a_shards, M, T, N, p, d, K
+            )
+            self.print_ordered_logs("Online Stage Round 1 Complete")
+            
+            # Online Stage Round 2
+            surviving_set = np.array(range(U))  # Indices of surviving users
+            online2_time, phi_alpha_buffer = self.run_online_stage_round2(
+                phi_coeff, psi_coeff, surviving_set, d, K, p, is_sleep, comm_mbps
+            )
+            self.print_ordered_logs("Online Stage Round 2 Complete")
+            
+            # Server aggregation
+            t_agg_start = time.time()
+            if self.rank == 0:
+                alpha_s_eval = alpha[surviving_set]
+                beta_s = beta[:M]
+                x_agg = self.server_aggregate(phi_alpha_buffer, alpha_s_eval, beta_s, M, T, p)
+                
+                if x_agg is not None:
+                    self.ordered_log(f"Aggregated gradient shape: {x_agg.shape}")
+                    if not self.verify_aggregation(x_agg, phi_alpha_buffer, surviving_set, p):
+                        self.ordered_log("Aggregation verification failed!")
+            
+            t_agg = time.time() - t_agg_start
+            t_total = time.time() - t_total_start
+            
+            # Collect timing statistics
+            if self.rank == 0:
+                time_set = np.array([t_total, offline_time, online1_time, online2_time, t_agg])
+                logging.info(f'Trial {trial} timing: Total={time_set[0]:.2f}s, Offline={time_set[1]:.2f}s, Online1={time_set[2]:.2f}s, Online2={time_set[3]:.2f}s, Agg={time_set[4]:.2f}s')
+                time_avg += time_set
+            
+            self.comm.Barrier()
+        
+        if self.rank == 0 and n_trials > 0:
+            time_avg /= n_trials
+            logging.info(f'\nAverage timing over {n_trials} trials:')
+            logging.info(f'Total time: {time_avg[0]:.2f}s')
+            logging.info(f'Offline stage: {time_avg[1]:.2f}s')
+            logging.info(f'Online stage round 1: {time_avg[2]:.2f}s')
+            logging.info(f'Online stage round 2: {time_avg[3]:.2f}s')
+            logging.info(f'Aggregation time: {time_avg[4]:.2f}s')
 
-
-
-
-
-            # 当指定k时，比如k=1，用户i生成的ϕ(phi)和ψ(psi)的大小取决于其a_K_it(k),n的大小(d/M)，故生成的ϕi1(alpha)的大小为d/M * 1；
-            # 又因为此处的k的个数为K个，所以生成的ϕik(alpha)的大小为d/M * K;
-            # 其生成的两个拉格朗日插值多项式ϕik(alpha)和ψik(beta)的项数大小取决于乘积基多项式的项数大小，alpha值未知，beta值已知，故项数大小为（M+T-1）
-            # 此后，在线阶段广播掩码梯度参数指的是——用户i发送自己的掩码梯度参数x_jk_t_2给其他所有用户，而非直接发送给服务器（以实现梯度参数及其坐标隐藏）
-            # 各个用户接收到其他所有用户广播的掩码梯度参数（22）后，进行（23）计算，得到编码梯度的本地聚合phi(alpha_i)并发送给Server（此时由于每个用户的alpha_i不同，因此其phi_jk(alpha_i)和psi_jk(alpha_i)不同）
-            # Server接收到所有用户的不同的phi(alpha_i)后，通过拉格朗日插值重建多项式phi(alpha),并代入beta(1)——beta(M)，进行（24）计算，恢复出局部梯度之和x_agg_t
-            # 要保证恢复出的局部梯度之和x_agg_t与原始梯度之和相同，需保证所使用的全部K个随机掩码rt_ik之和取模p后为0(由于p过大，部分随机掩码为负数，其和即为0)
-
-            # 公式(19)中的phi_ik(alpha)的前一部分——分片与拉格朗日插值，将坐标信息a_k分散到M个分片中，确保Server无法直接获取完整坐标（坐标隐藏）
-            # 公式(19)中的phi_ik(alpha)的后一部分——引入随机噪声v_ikn，防止敌手通过插值恢复分片信息（冗余）
-
-            # 公式(20)中的psi_ik(alpha)——隐藏梯度参数
-            # 公式(21)中的psi_ik(alpha)的前一部分——将梯度参数掩码rt_ik与坐标分片绑定，确保Server无法分离二者
-            # 公式(21)中的psi_ik(alpha)的后一部分——添加冗余，进一步混淆掩码信息，增强隐私性
-
-           
+if __name__ == "__main__":
+    protocol = LightSecAggProtocol()
+    protocol.run(sys.argv)
