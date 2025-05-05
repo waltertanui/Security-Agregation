@@ -1,0 +1,17 @@
+
+.idea/LightSecAgg.iml
+.idea/misc.xml
+.idea/modules.xml
+.idea/vcs.xml
+.idea/workspace.xml
+.idea
+.idea/
+
+*.h5
+*.bz2
+*.zip
+*.json
+./data/*
+*.pyc
+
+data/MNIST/test/a
