@@ -157,7 +157,7 @@ class LightSecAggProtocol:
         """Aggregate user submissions on the server"""
         U = len(alpha_s_eval)
         if U < M + T:
-            logging.error(f"Not enough surviving users (got {U}, need at least {M+T})")
+            logging.error(f"Server aggregation failed: Not enough surviving users (got {U}, need at least {M+T})")
             return None
         
         if U > M + T:
@@ -234,10 +234,11 @@ class LightSecAggProtocol:
 
     def run_online_stage_round1(self, alpha: np.ndarray, beta: np.ndarray,
                               a_shards: np.ndarray, M: int, T: int, N: int,
-                              p: int, d: int, K: int) -> Tuple[float, Optional[Tuple[np.ndarray, np.ndarray]]]:
+                              p: int, d: int, K: int) -> Tuple[float, float, Optional[Tuple[np.ndarray, np.ndarray]]]:
+        """Execute first round of online stage with encoding time measurement"""
         t_start = time.time()
         if self.rank == 0:  # Server does nothing in round 1
-            return time.time() - t_start, (None, None)
+            return time.time() - t_start, 0.0, (None, None)
         try:
             # Users generate their random masks
             rt_ik = self.rng.integers(0, p, size=K, dtype=np.int64)
@@ -273,11 +274,13 @@ class LightSecAggProtocol:
             u_ikn = self.rng.integers(0, p, size=(K, T), dtype=np.int64)
             self.ordered_log(f"Generated v_ikn.shape={v_ikn.shape}, u_ikn.shape={u_ikn.shape}")
 
-            # Generate Lagrange polynomials
+            # Generate Lagrange polynomials with timing
+            t_encoding_start = time.time()
             phi, psi = self.generate_lagrange_polynomials(
                 alpha, beta, a_shards, rt_ik, v_ikn, u_ikn, M, T, N, p
             )
-            self.ordered_log(f"Generated phi.shape={phi.shape}, psi.shape={psi.shape}")
+            encoding_time = time.time() - t_encoding_start
+            self.ordered_log(f"Generated phi.shape={phi.shape}, psi.shape={psi.shape}, Encoding time={encoding_time:.2f}s")
 
             # Exchange polynomials between users
             phi_coeff = np.zeros((K, N), dtype=np.int64)
@@ -302,106 +305,130 @@ class LightSecAggProtocol:
                     self.ordered_log(f"Received phi/psi from User {j}")
 
             online1_time = time.time() - t_start
-            return online1_time, (phi_coeff, psi_coeff)
+            return online1_time, encoding_time, (phi_coeff, psi_coeff)
         except Exception as e:
             logging.error(f"User {self.rank} online stage round 1 failed: {str(e)}")
-            return time.time() - t_start, (None, None)
+            return time.time() - t_start, 0.0, (None, None)
 
     def run_online_stage_round2(self, phi_coeff: np.ndarray, psi_coeff: np.ndarray,
                               surviving_set: np.ndarray, d: int, K: int,
-                              p: int, is_sleep: bool, comm_mbps: float) -> Tuple[float, np.ndarray]:
-        """Execute second round of online stage"""
+                              p: int, is_sleep: bool, comm_mbps: float) -> Tuple[float, float, np.ndarray]:
+        """Execute second round of online stage with communication time measurement"""
         t_start = time.time()
         
         if self.rank == 0:  # Server
-            phi_alpha_buffer = np.zeros((len(surviving_set), K), dtype=np.int64)
-            active_users = []
-            
-            # Check which users are active
-            for j in range(1, self.size):
-                status = np.array([0], dtype=np.int64)
-                self.comm.Recv([status, MPI.INT64_T], source=j, tag=999)
-                self.ordered_log(f"Received status={status[0]} from user {j}")
+            try:
+                phi_alpha_buffer = np.zeros((len(surviving_set), K), dtype=np.int64)
+                active_users = []
                 
-                if status[0] == 1:
-                    active_users.append(j-1)
-                    self.ordered_log(f"Will receive from user {j}")
+                # Check which users are active
+                self.ordered_log(f"Collecting statuses from {self.size-1} users")
+                for j in range(1, self.size):
+                    status = np.array([0], dtype=np.int64)
+                    self.comm.Recv([status, MPI.INT64_T], source=j, tag=999)
+                    self.ordered_log(f"Received status={status[0]} from user {j}")
+                    
+                    if status[0] == 1:
+                        active_users.append(j-1)
+                        self.ordered_log(f"Will receive from user {j}")
+                
+                # Return early if not enough users
+                if len(active_users) < len(surviving_set):
+                    self.ordered_log(f"Not enough surviving users (got {len(active_users)}, need {len(surviving_set)})")
+                    logging.error(f"Skipping trial due to insufficient active users: {len(active_users)} < {len(surviving_set)}")
+                    online2_time = time.time() - t_start
+                    self.print_ordered_logs("Online Stage Round 2 Failed")
+                    return online2_time, 0.0, np.array([])
+                
+                # Receive masked gradients from active users
+                self.ordered_log(f"Receiving phi_alpha from {len(active_users)} active users")
+                for j in active_users:
+                    self.comm.Recv([phi_alpha_buffer[j,:], MPI.INT64_T], source=j+1, tag=3)
+                    self.ordered_log(f"Received phi_alpha from user {j+1}")
+                
+                online2_time = time.time() - t_start
+                self.ordered_log("Completed Round 2 successfully")
+                return online2_time, 0.0, phi_alpha_buffer
             
-            if len(active_users) < len(surviving_set):
-                self.ordered_log(f"Not enough surviving users (got {len(active_users)}, need {len(surviving_set)})")
-                self.comm.Abort()
-            
-            # Receive masked gradients from active users
-            for j in active_users:
-                self.comm.Recv([phi_alpha_buffer[j,:], MPI.INT64_T], source=j+1, tag=3)
-                self.ordered_log(f"Received phi_alpha from user {j+1}")
-            
-            online2_time = time.time() - t_start
-            return online2_time, phi_alpha_buffer
+            except Exception as e:
+                logging.error(f"Server Round 2 failed: {str(e)}")
+                online2_time = time.time() - t_start
+                self.print_ordered_logs("Online Stage Round 2 Failed")
+                return online2_time, 0.0, np.array([])
         
         else:  # Users
-            # Simulate dropout
-            is_active = self.rng.random() > 0.1  # 10% dropout rate
-            status = np.array([1 if is_active else 0], dtype=np.int64)
-            self.comm.Send([status, MPI.INT64_T], dest=0, tag=999)
-            self.ordered_log(f"Sent status={status[0]} to server")
-            
-            if not is_active:
-                self.ordered_log("Dropped out")
-                return time.time() - t_start, np.array([])
-            
-            # Simulate local training
-            time.sleep(5)  # Simulate computation
-            
-            # Generate and mask gradient
-            bt_i = self.rng.integers(0, 2, size=d, dtype=np.int64)
-            kt_i = self.rng.choice(d, size=K, replace=False)
-            xt_i = self.rng.standard_normal(d).astype(np.int64)  # <-- FIXED HERE
-            xt_i_1 = bt_i * xt_i
-            xt_i_mod = self.real_to_finite_field(xt_i_1, p)
-            
-            xt_i_mod_masked = np.zeros(K, dtype=np.int64)
-            for k in range(K):
-                xt_i_mod_masked[k] = xt_i_mod[kt_i[k]]
-            
-            # Exchange masked gradients between surviving users
-            global_masked_buffer = np.zeros((self.size-1, K), dtype=np.int64)
-            my_idx = self.rank - 1
-            
-            if my_idx in surviving_set:
-                for j in range(1, self.size):
-                    if j != self.rank:
-                        self.comm.Send([xt_i_mod_masked, MPI.INT64_T], dest=j, tag=3)
-                        self.ordered_log(f"Sent masked model to User {j}")
+            try:
+                my_idx = self.rank - 1
+                # Only users in surviving_set are active
+                is_active = my_idx in surviving_set
+                status = np.array([1 if is_active else 0], dtype=np.int64)
+                self.comm.Send([status, MPI.INT64_T], dest=0, tag=999)
+                self.ordered_log(f"Sent status={status[0]} to server")
                 
-                global_masked_buffer[my_idx,:] = xt_i_mod_masked
-            
-            if is_sleep:
-                comm_time = K / comm_mbps / (2**20) * 32
-                time.sleep(comm_time)
-            
-            for j in range(1, self.size):
-                if j != self.rank:
-                    temp_buf = np.empty(K, dtype=np.int64)
-                    self.comm.Recv([temp_buf, MPI.INT64_T], source=j, tag=3)
-                    global_masked_buffer[j-1,:] = temp_buf
-                    self.ordered_log(f"Received masked model from User {j}")
-            
-            # Compute final submission to server
-            phi_alpha_i = np.zeros(K, dtype=np.int64)
-            if my_idx in surviving_set and is_active:
+                if not is_active:
+                    self.ordered_log("Not in surviving set")
+                    return time.time() - t_start, 0.0, np.array([])
+                
+                # Simulate local training
+                time.sleep(5)  # Simulate computation
+                
+                # Generate and mask gradient
+                bt_i = self.rng.integers(0, 2, size=d, dtype=np.int64)
+                kt_i = self.rng.choice(d, size=K, replace=False)
+                xt_i = self.rng.standard_normal(d).astype(np.int64)
+                xt_i_1 = bt_i * xt_i
+                xt_i_mod = self.real_to_finite_field(xt_i_1, p)
+                
+                xt_i_mod_masked = np.zeros(K, dtype=np.int64)
                 for k in range(K):
-                    for j in surviving_set:
-                        val = global_masked_buffer[j,k]
-                        phi_val = phi_coeff[k,j]
-                        psi_val = psi_coeff[k,j]
-                        phi_alpha_i[k] = (phi_alpha_i[k] + val * phi_val + psi_val) % p
+                    xt_i_mod_masked[k] = xt_i_mod[kt_i[k]]
                 
-                self.comm.Send([phi_alpha_i, MPI.INT64_T], dest=0, tag=3)
-                self.ordered_log(f"Sent phi_alpha_i to Server")
+                # Exchange masked gradients between surviving users
+                global_masked_buffer = np.zeros((self.size-1, K), dtype=np.int64)
+                my_idx = self.rank - 1
+                
+                if my_idx in surviving_set:
+                    for j in range(1, self.size):
+                        if j != self.rank and (j-1) in surviving_set:
+                            self.comm.Send([xt_i_mod_masked, MPI.INT64_T], dest=j, tag=3)
+                            self.ordered_log(f"Sent masked model to User {j}")
+                    
+                    global_masked_buffer[my_idx,:] = xt_i_mod_masked
+                
+                # Simulate communication time if is_sleep is true
+                if is_sleep:
+                    comm_time = K / comm_mbps / (2**20) * 32
+                    time.sleep(comm_time)
+                    self.ordered_log(f"Simulated communication time: {comm_time:.2f}s")
+                else:
+                    comm_time = 0.0
+                
+                for j in range(1, self.size):
+                    if j != self.rank and (j-1) in surviving_set:
+                        temp_buf = np.empty(K, dtype=np.int64)
+                        self.comm.Recv([temp_buf, MPI.INT64_T], source=j, tag=3)
+                        global_masked_buffer[j-1,:] = temp_buf
+                        self.ordered_log(f"Received masked model from User {j}")
+                
+                # Compute final submission to server
+                phi_alpha_i = np.zeros(K, dtype=np.int64)
+                if my_idx in surviving_set and is_active:
+                    for k in range(K):
+                        for j in surviving_set:
+                            val = global_masked_buffer[j,k]
+                            phi_val = phi_coeff[k,j]
+                            psi_val = psi_coeff[k,j]
+                            phi_alpha_i[k] = (phi_alpha_i[k] + val * phi_val + psi_val) % p
+                    
+                    self.comm.Send([phi_alpha_i, MPI.INT64_T], dest=0, tag=3)
+                    self.ordered_log(f"Sent phi_alpha_i to Server")
+                
+                online2_time = time.time() - t_start
+                return online2_time, comm_time, phi_alpha_i
             
-            online2_time = time.time() - t_start
-            return online2_time, phi_alpha_i
+            except Exception as e:
+                logging.error(f"User {self.rank} Round 2 failed: {str(e)}")
+                return time.time() - t_start, 0.0, np.array([])
 
     def run(self, args: List[str]):
         """Main execution flow for LightSecAgg protocol"""
@@ -415,7 +442,7 @@ class LightSecAggProtocol:
             self.comm.Abort()
         
         T = int(np.floor(N/2))
-        U = max(T + 1, N)  # Number of surviving users
+        U = T + 1  # Number of surviving users, ensures U < N for N > 1
         p = 2**31-1  # Prime for finite field
         n_trials = 3  # Number of trials to average timing
         K = int(0.01 * d)  # Number of coordinates to use
@@ -432,7 +459,7 @@ class LightSecAggProtocol:
         if self.rank == 0:
             logging.info(f"Starting with N={N}, U={U}, T={T}, d={d}, K={K}, M={M}")
         
-        time_avg = np.zeros(5, dtype=float)  # For timing statistics
+        time_avg = np.zeros(5, dtype=float)  # For timing statistics: total, encoding, offline total, comm, decoding
         
         for trial in range(n_trials):
             t_total_start = time.time()
@@ -443,14 +470,14 @@ class LightSecAggProtocol:
             self.print_ordered_logs("Offline Stage Complete")
             
             # Online Stage Round 1
-            online1_time, (phi_coeff, psi_coeff) = self.run_online_stage_round1(
+            online1_time, encoding_time, (phi_coeff, psi_coeff) = self.run_online_stage_round1(
                 alpha, beta, a_shards, M, T, N, p, d, K
             )
             self.print_ordered_logs("Online Stage Round 1 Complete")
             
             # Online Stage Round 2
-            surviving_set = np.array(range(U))  # Indices of surviving users
-            online2_time, phi_alpha_buffer = self.run_online_stage_round2(
+            surviving_set = np.array(range(U))  # Indices of surviving users (0 to U-1)
+            online2_time, comm_time, phi_alpha_buffer = self.run_online_stage_round2(
                 phi_coeff, psi_coeff, surviving_set, d, K, p, is_sleep, comm_mbps
             )
             self.print_ordered_logs("Online Stage Round 2 Complete")
@@ -458,34 +485,63 @@ class LightSecAggProtocol:
             # Server aggregation
             t_agg_start = time.time()
             if self.rank == 0:
-                alpha_s_eval = alpha[surviving_set]
-                beta_s = beta[:M]
-                x_agg = self.server_aggregate(phi_alpha_buffer, alpha_s_eval, beta_s, M, T, p)
-                
-                if x_agg is not None:
-                    self.ordered_log(f"Aggregated gradient shape: {x_agg.shape}")
-                    if not self.verify_aggregation(x_agg, phi_alpha_buffer, surviving_set, p):
-                        self.ordered_log("Aggregation verification failed!")
+                if phi_alpha_buffer.size == 0:
+                    self.ordered_log("Skipping aggregation due to failed Round 2")
+                else:
+                    alpha_s_eval = alpha[surviving_set]
+                    beta_s = beta[:M]
+                    x_agg = self.server_aggregate(phi_alpha_buffer, alpha_s_eval, beta_s, M, T, p)
+                    
+                    if x_agg is not None:
+                        self.ordered_log(f"Aggregated gradient shape: {x_agg.shape}")
+                        if not self.verify_aggregation(x_agg, phi_alpha_buffer, surviving_set, p):
+                            self.ordered_log("Aggregation verification failed!")
             
             t_agg = time.time() - t_agg_start
             t_total = time.time() - t_total_start
             
-            # Collect timing statistics
-            if self.rank == 0:
-                time_set = np.array([t_total, offline_time, online1_time, online2_time, t_agg])
-                logging.info(f'Trial {trial} timing: Total={time_set[0]:.2f}s, Offline={time_set[1]:.2f}s, Online1={time_set[2]:.2f}s, Online2={time_set[3]:.2f}s, Agg={time_set[4]:.2f}s')
-                time_avg += time_set
+            # Collect timing data from users
+            if self.rank != 0:
+                offline_total_time = offline_time + online1_time
+                times = np.array([encoding_time, offline_total_time, comm_time], dtype=float)
+                self.comm.Send([times, MPI.DOUBLE], dest=0, tag=4)
             
+            if self.rank == 0:
+                all_times = np.empty((N, 3), dtype=float)  # encoding, offline total, comm
+                for i in range(1, N+1):
+                    times = np.empty(3, dtype=float)
+                    self.comm.Recv([times, MPI.DOUBLE], source=i, tag=4)
+                    all_times[i-1, :] = times
+                
+                # Compute averages for user-side times
+                avg_encoding_time = np.mean(all_times[:, 0])
+                avg_offline_total_time = np.mean(all_times[:, 1])
+                avg_comm_time = np.mean(all_times[:, 2])
+                
+                # Log trial timing
+                logging.info(f'Trial {trial+1} timing: Total={t_total:.2f}s, Offline Encoding={avg_encoding_time:.2f}s, '
+                             f'Offline Total={avg_offline_total_time:.2f}s, Communication={avg_comm_time:.2f}s, Decoding={t_agg:.2f}s')
+                
+                # Accumulate for average
+                time_avg[0] += t_total
+                time_avg[1] += avg_encoding_time
+                time_avg[2] += avg_offline_total_time
+                time_avg[3] += avg_comm_time
+                time_avg[4] += t_agg
+            
+            self.ordered_log(f"Completed trial {trial+1}")
+            self.print_ordered_logs(f"Trial {trial+1} Complete")
             self.comm.Barrier()
         
+        # Print final average timing
         if self.rank == 0 and n_trials > 0:
             time_avg /= n_trials
             logging.info(f'\nAverage timing over {n_trials} trials:')
             logging.info(f'Total time: {time_avg[0]:.2f}s')
-            logging.info(f'Offline stage: {time_avg[1]:.2f}s')
-            logging.info(f'Online stage round 1: {time_avg[2]:.2f}s')
-            logging.info(f'Online stage round 2: {time_avg[3]:.2f}s')
-            logging.info(f'Aggregation time: {time_avg[4]:.2f}s')
+            logging.info(f'Offline encoding time: {time_avg[1]:.2f}s')
+            logging.info(f'Offline total time: {time_avg[2]:.2f}s')
+            logging.info(f'Communication time: {time_avg[3]:.2f}s')
+            logging.info(f'Decoding time: {time_avg[4]:.2f}s')
 
 if __name__ == "__main__":
     protocol = LightSecAggProtocol()
